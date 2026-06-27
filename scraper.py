@@ -9,7 +9,7 @@ from pyrogram import Client, filters
 load_dotenv()
 
 URL = os.getenv("DEFAULT_URL", "https://t.me/+FGb29j_u1bpmMjEx")
-CHAT_ID = os.getenv("CHAT_ID", "-1004453461157")
+CHAT_ID = int(os.getenv("CHAT_ID", "-1004453461157"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8603042415:AAGjOKwH8uDaLG5AWjP-CTh0hQ6qHGTJ_2Y")
 API_ID = int(os.getenv("API_ID", "32947515"))
 API_HASH = os.getenv("API_HASH", "cc73af06049861e86e404ddd1fc6da35")
@@ -57,24 +57,28 @@ def build_message(url, title, desc, links):
         parts.append(f"{i}. {t or 'No text'}")
         parts.append(h)
         parts.append("")
-    return "\n".join(parts)[:3900]   # ✅ Fix 1: "\n" sahi string
+    return "\n".join(parts)[:3900]
 
 async def send_result(url, target_chat_id):
     title, desc, links = scrape_page(url)
     message = build_message(url, title, desc, links)
-    await app.send_message(target_chat_id, message, disable_web_page_preview=True)
+    try:
+        await app.get_chat(target_chat_id)
+    except Exception:
+        pass
+    await app.send_message(int(target_chat_id), message, disable_web_page_preview=True)
 
 @app.on_message(filters.command("scrape"))
 async def scrape_cmd(client, message):
     text = message.text or ""
     parts = text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) > 1 else URL  # ✅ Fix 2: URL (DEFAULT_URL nahi)
+    url = parts[1].strip() if len(parts) > 1 else URL
     await message.reply_text("Scraping started...")
     await send_result(url, message.chat.id)
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")  # ✅ Fix 3: URL
+    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
     args = parser.parse_args()
 
     async with app:
