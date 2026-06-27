@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import shutil
 import asyncio
 import tempfile
 import requests
@@ -8,12 +10,13 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from app.bot import app
 from app.scraper import extract_post_metadata, extract_post_links, scrape_page_info, HEADERS
 from app.config import get_channel, set_channel
+from app.db import is_processed, mark_processed, get_stats
 from app.utils.logger import logger
 from app.utils.thumb import make_collage, download_thumb
 
 MD = enums.ParseMode.MARKDOWN
-
 SEND_DELAY = 3
+MIN_FREE_MB = 200
 
 
 def progress_bar(done: int, total: int) -> str:
@@ -25,6 +28,10 @@ def progress_bar(done: int, total: int) -> str:
     return f"[{bar}] {int(pct * 100)}%  ({done // (1024*1024)}MB / {total // (1024*1024)}MB)"
 
 
+def free_mb() -> int:
+    return shutil.disk_usage("/").free // (1024 * 1024)
+
+
 def build_caption(title: str, desc: str, tags: list, video_count: int, videos: list) -> str:
     ext = "MP4"
     if videos:
@@ -34,16 +41,16 @@ def build_caption(title: str, desc: str, tags: list, video_count: int, videos: l
                 break
     tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in tags[:8]) if tags else ""
     parts = [
-        f"━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━",
         f"🎬 *{title.upper()}*",
-        f"━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
     if desc:
         parts.append(f"\n📝 _{desc[:250]}_")
     if tag_str:
         parts.append(f"\n🏷 {tag_str}")
     parts.append(f"\n📦 *{video_count} Video{'s' if video_count > 1 else ''}*  |  `{ext}`")
-    parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+    parts.append("━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(parts)
 
 
@@ -63,11 +70,20 @@ def extract_url_from_message(message) -> str | None:
     return None
 
 
+def next_page_url(url: str) -> str | None:
+    """Auto-detect and increment page number in URL."""
+    m = re.search(r'(/\w*?)(\d+)(/?)$', url)
+    if m:
+        return url[:m.start()] + m.group(1) + str(int(m.group(2)) + 1) + m.group(3)
+    if url.endswith("/"):
+        return url + "2"
+    return url + "/2"
+
+
 _peer_cache: dict = {}
 
 
 async def resolve_peer(client, chat_id):
-    """Resolve and cache peer so Pyrogram can find it."""
     key = str(chat_id)
     if key not in _peer_cache:
         try:
@@ -75,82 +91,97 @@ async def resolve_peer(client, chat_id):
             _peer_cache[key] = chat.id
             logger.info(f"Peer resolved: {chat_id} → {chat.id} ({getattr(chat, 'title', '')})")
         except Exception as e:
-            logger.error(f"Peer resolve failed for {chat_id}: {e}")
+            logger.error(f"Peer resolve failed {chat_id}: {e}")
             return None
     return _peer_cache[key]
 
 
-async def safe_send_video(client, chat_id, video, caption, status_msg=None):
-    """Send video with FloodWait retry."""
-    resolved = await resolve_peer(client, chat_id)
-    if resolved is None:
-        logger.error(f"Cannot send video — peer not resolved: {chat_id}")
+async def flood_wait(e: FloodWait, status_msg=None):
+    wait = e.value + 2
+    logger.warning(f"FloodWait {wait}s")
+    for remaining in range(wait, 0, -5):
         if status_msg:
             try:
                 await status_msg.edit_text(
-                    f"❌ Channel/Group access error!\n\nBot ko `{chat_id}` mein *admin* banao phir `/setchannel` dobara karo.",
+                    f"⏳ *Flood limit!*\n{remaining}s baad automatically resume hoga...",
+                    parse_mode=MD,
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(min(5, remaining))
+
+
+async def safe_send_video(client, chat_id, video, caption, status_msg=None) -> bool:
+    resolved = await resolve_peer(client, chat_id)
+    if resolved is None:
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"❌ *Channel access error!*\nBot ko `{chat_id}` mein admin banao phir `/setchannel` dobara karo.",
                     parse_mode=MD,
                 )
             except Exception:
                 pass
         return False
 
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             await client.send_video(
-                chat_id=resolved,
-                video=video,
-                caption=caption,
-                supports_streaming=True,
+                chat_id=resolved, video=video, caption=caption, supports_streaming=True,
             )
             await asyncio.sleep(SEND_DELAY)
             return True
         except FloodWait as e:
-            wait = e.value + 2
-            logger.warning(f"FloodWait {wait}s — waiting...")
-            if status_msg:
-                try:
-                    await status_msg.edit_text(f"⏳ Flood limit — {wait}s ruk raha hoon...", parse_mode=MD)
-                except Exception:
-                    pass
-            await asyncio.sleep(wait)
+            await flood_wait(e, status_msg)
         except Exception as e:
-            logger.error(f"send_video error (attempt {attempt+1}): {e}")
-            if attempt == 2:
+            logger.error(f"send_video attempt {attempt+1}: {e}")
+            if attempt == 4:
                 return False
+            await asyncio.sleep(2)
     return False
 
 
-async def safe_send_photo(client, chat_id, photo, caption):
-    """Send photo with FloodWait retry."""
+async def safe_send_photo(client, chat_id, photo, caption) -> bool:
     resolved = await resolve_peer(client, chat_id)
     if resolved is None:
         return False
-
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             await client.send_photo(chat_id=resolved, photo=photo, caption=caption, parse_mode=MD)
             await asyncio.sleep(SEND_DELAY)
             return True
         except FloodWait as e:
-            await asyncio.sleep(e.value + 2)
+            await flood_wait(e)
         except Exception as e:
-            logger.error(f"send_photo error (attempt {attempt+1}): {e}")
-            if attempt == 2:
+            logger.error(f"send_photo attempt {attempt+1}: {e}")
+            if attempt == 4:
                 return False
+            await asyncio.sleep(2)
     return False
 
 
 async def download_video(video_url: str, referer: str, status_msg, label: str) -> str | None:
+    if free_mb() < MIN_FREE_MB:
+        logger.warning(f"Low disk: {free_mb()}MB free — skipping download")
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"⚠️ *Disk space low!* ({free_mb()}MB free)\nDownload skip kar raha hoon...",
+                    parse_mode=MD,
+                )
+            except Exception:
+                pass
+        return None
+
     tmp_path = None
     try:
-        dl_headers = {**HEADERS, "Referer": referer}
         suffix = ".mp4"
         for ext in [".mp4", ".webm", ".mkv", ".mov", ".flv"]:
             if ext in video_url.lower():
                 suffix = ext
                 break
 
+        dl_headers = {**HEADERS, "Referer": referer}
         with requests.get(video_url, headers=dl_headers, stream=True, timeout=120) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
@@ -167,7 +198,10 @@ async def download_video(video_url: str, referer: str, status_msg, label: str) -
                         if now - last_edit > 2:
                             bar = progress_bar(done, total)
                             try:
-                                await status_msg.edit_text(f"⬇️ *{label}*\n{bar}", parse_mode=MD)
+                                await status_msg.edit_text(
+                                    f"⬇️ *{label}*\n{bar}\n💾 Free: {free_mb()}MB",
+                                    parse_mode=MD,
+                                )
                             except (MessageNotModified, Exception):
                                 pass
                             last_edit = now
@@ -179,20 +213,61 @@ async def download_video(video_url: str, referer: str, status_msg, label: str) -
         return None
 
 
+@app.on_message(filters.command("help"))
+async def help_cmd(client, message):
+    stats = get_stats()
+    ch = get_channel()
+    ch_info = f"`{ch}`" if ch else "Not set"
+    await message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 *SCRAPER BOT — HELP*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*📥 Download Commands:*\n"
+        "`/get <url>` — Ek post ke saare videos download karo\n"
+        "`/mget <url>` — Page ke saare posts bulk download karo (auto multi-page)\n\n"
+        "*🔍 Info Commands:*\n"
+        "`/video <url>` — Sirf video links list karo\n"
+        "`/scrape <url>` — Page title, desc, links dekho\n\n"
+        "*📡 Channel Commands:*\n"
+        "`/setchannel <id>` — Upload channel set karo\n"
+        "`/getchannel` — Current channel dekho\n\n"
+        "*📊 Stats:*\n"
+        "`/stats` — Processed posts count\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "*⚙️ Features:*\n"
+        "• Auto multi-page — `/mget` khud pages badlata hai\n"
+        "• MongoDB tracking — processed posts skip karta hai\n"
+        "• FloodWait auto-resume — flood aye toh ruk kar resume karta hai\n"
+        "• Disk guard — storage full hone se pehle warn karta hai\n"
+        "• Thumbnail collage — saare thumbs ek pic mein\n\n"
+        f"📡 Channel: {ch_info}\n"
+        f"📊 Total Processed: *{stats['total']}* posts\n"
+        "━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=MD,
+    )
+
+
+@app.on_message(filters.command("stats"))
+async def stats_cmd(client, message):
+    stats = get_stats()
+    ch = get_channel()
+    await message.reply_text(
+        f"📊 *Bot Stats*\n\n"
+        f"✅ Processed posts: *{stats['total']}*\n"
+        f"📡 Channel: `{ch or 'Not set'}`\n"
+        f"💾 Free disk: *{free_mb()} MB*",
+        parse_mode=MD,
+    )
+
+
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    ch = get_channel()
-    ch_info = f"📡 Connected: `{ch}`" if ch else "📡 Channel: not connected"
     await message.reply_text(
         "🤖 *Bot Online Hai!*\n\n"
-        "Commands:\n"
-        "`/get <url>` — Ek post ke saare videos download + bhejo\n"
-        "`/mget <url>` — Page ke saare posts ke videos bulk download\n"
-        "`/setchannel <id>` — Upload channel set karo\n"
-        "`/getchannel` — Current channel dekho\n"
-        "`/video <url>` — Sirf video links list\n"
-        "`/scrape <url>` — Page info\n\n"
-        f"{ch_info}",
+        "`/help` — Sab commands dekho\n"
+        "`/get <url>` — Single post download\n"
+        "`/mget <url>` — Bulk download (auto multi-page)\n"
+        "`/setchannel <id>` — Channel connect karo",
         parse_mode=MD,
     )
 
@@ -209,9 +284,10 @@ async def setchannel_cmd(client, message):
         return
     raw = parts[1].strip()
     channel_id = int(raw) if raw.lstrip("-").isdigit() else raw
+    _peer_cache.clear()
     set_channel(channel_id)
     logger.info(f"Channel set: {channel_id}")
-    await message.reply_text(f"✅ Channel set ho gaya:\n`{channel_id}`", parse_mode=MD)
+    await message.reply_text(f"✅ Channel set:\n`{channel_id}`", parse_mode=MD)
 
 
 @app.on_message(filters.command("getchannel"))
@@ -220,7 +296,9 @@ async def getchannel_cmd(client, message):
     if ch:
         await message.reply_text(f"📡 Current channel: `{ch}`", parse_mode=MD)
     else:
-        await message.reply_text("❌ Koi channel connect nahi hai.\n`/setchannel <id>` se connect karo.", parse_mode=MD)
+        await message.reply_text(
+            "❌ Channel set nahi hai.\n`/setchannel <id>` se set karo.", parse_mode=MD
+        )
 
 
 @app.on_message(filters.command("get"))
@@ -234,73 +312,53 @@ async def get_cmd(client, message):
     dest = channel or message.chat.id
     logger.info(f"/get {url} → {dest}")
 
-    status = await message.reply_text(
-        f"🔍 *Scan kar raha hoon...*", parse_mode=MD, disable_web_page_preview=True
-    )
+    status = await message.reply_text("🔍 *Scan kar raha hoon...*", parse_mode=MD)
 
     try:
         meta = extract_post_metadata(url)
     except Exception as e:
-        logger.error(f"/get error: {e}")
         await status.edit_text(f"❌ Page load error: {e}")
         return
 
     title = meta["title"]
-    desc = meta["desc"]
-    tags = meta["tags"]
-    thumbnail = meta["thumbnail"]
     videos = meta["videos"]
     iframes = meta["iframes"]
 
     if not videos:
-        if iframes:
-            msg = f"⚠️ Direct video nahi mila.\n\n🖼 Player links ({len(iframes)}):\n"
-            for i, v in enumerate(iframes[:5], 1):
-                msg += f"\n{i}. {v}"
-            await status.edit_text(msg, disable_web_page_preview=True)
-        else:
-            await status.edit_text("❌ Koi video link nahi mila.")
+        msg = f"⚠️ Direct video nahi mila.\n\n🖼 Players ({len(iframes)}):\n" + "\n".join(iframes[:5]) if iframes else "❌ Koi video nahi mila."
+        await status.edit_text(msg, disable_web_page_preview=True)
         return
 
-    caption = build_caption(title, desc, tags, len(videos), videos)
+    caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
 
     await status.edit_text(
-        f"✅ *{title[:70]}*\n🎬 {len(videos)} video(s) mili\n📤 Upload ho rahi hain...",
-        parse_mode=MD,
-        disable_web_page_preview=True,
+        f"✅ *{title[:60]}*\n🎬 {len(videos)} video(s)\n📤 Upload shuru...",
+        parse_mode=MD, disable_web_page_preview=True,
     )
 
-    thumb_path = download_thumb(thumbnail) if thumbnail else None
+    thumb_path = download_thumb(meta["thumbnail"]) if meta["thumbnail"] else None
     if thumb_path:
         try:
             await safe_send_photo(client, dest, thumb_path, caption)
-        except Exception:
-            pass
         finally:
             if os.path.exists(thumb_path):
                 os.remove(thumb_path)
 
     for idx, video_url in enumerate(videos, 1):
-        tmp_path = await download_video(
-            video_url, url, status,
-            f"Downloading {idx}/{len(videos)} — {title[:40]}"
-        )
+        tmp_path = await download_video(video_url, url, status, f"Downloading {idx}/{len(videos)}")
         if not tmp_path:
             continue
         try:
             await status.edit_text(f"📤 *Uploading {idx}/{len(videos)}...*", parse_mode=MD)
             vid_cap = f"🎬 {idx}/{len(videos)} — {title}" if len(videos) > 1 else title
             await safe_send_video(client, dest, tmp_path, vid_cap, status)
-            logger.info(f"Sent video {idx}/{len(videos)}")
-        except Exception as e:
-            logger.error(f"Upload error vid {idx}: {e}")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    mark_processed(url, title, len(videos))
     await status.edit_text(
-        f"✅ *Done!*\n📄 {title[:70]}\n🎬 {len(videos)} videos bheje → `{dest}`",
-        parse_mode=MD,
+        f"✅ *Done!* — {title[:60]}\n🎬 {len(videos)} videos → `{dest}`", parse_mode=MD,
     )
 
 
@@ -309,7 +367,7 @@ async def mget_cmd(client, message):
     url = extract_url_from_message(message)
     if not url:
         await message.reply_text(
-            "URL do: `/mget https://desihub.to/explore/1`\n\nPage ke saare posts bulk download karega.",
+            "URL do: `/mget https://desihub.to/explore/1`\n\nBot khud saare pages scan karega jab tak posts milte rahein.",
             parse_mode=MD,
         )
         return
@@ -319,132 +377,165 @@ async def mget_cmd(client, message):
     logger.info(f"/mget {url} → {dest}")
 
     status = await message.reply_text(
-        f"🔍 *Posts dhundh raha hoon...*", parse_mode=MD, disable_web_page_preview=True
-    )
-
-    try:
-        post_links = extract_post_links(url)
-    except Exception as e:
-        await status.edit_text(f"❌ Page error: {e}")
-        return
-
-    if not post_links:
-        await status.edit_text("❌ Koi post link nahi mila.")
-        return
-
-    total_posts = len(post_links)
-    await status.edit_text(
-        f"✅ *{total_posts} posts mile!*\nMetadata + thumbnails collect kar raha hoon...",
+        "🔍 *Bulk scrape shuru ho raha hai...*\nBot tab tak chalega jab tak saare posts khatam na ho jayein.",
         parse_mode=MD,
     )
 
-    all_meta = []
-    all_thumbs = []
+    current_url = url
+    page_num = 1
+    total_videos_sent = 0
+    total_skipped = 0
+    total_already_done = 0
+    empty_pages = 0
+    MAX_EMPTY_PAGES = 2
 
-    for i, post_url in enumerate(post_links, 1):
+    while True:
         try:
-            meta = extract_post_metadata(post_url)
-            meta["url"] = post_url
-            all_meta.append(meta)
-            if meta["thumbnail"]:
-                all_thumbs.append(meta["thumbnail"])
-            try:
-                await status.edit_text(
-                    f"📊 *Collecting {i}/{total_posts}*\n📄 {meta['title'][:60]}",
-                    parse_mode=MD,
-                )
-            except (MessageNotModified, Exception):
-                pass
-            await asyncio.sleep(0.5)
+            await status.edit_text(
+                f"📄 *Page {page_num} scan kar raha hoon...*\n`{current_url}`\n\n"
+                f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped} | 🔁 Already done: {total_already_done}",
+                parse_mode=MD, disable_web_page_preview=True,
+            )
+        except (MessageNotModified, Exception):
+            pass
+
+        try:
+            post_links = extract_post_links(current_url)
         except Exception as e:
-            logger.error(f"Meta error post {i}: {e}")
+            logger.error(f"Page {page_num} error: {e}")
+            break
+
+        if not post_links:
+            empty_pages += 1
+            logger.info(f"Empty page {page_num} ({empty_pages}/{MAX_EMPTY_PAGES})")
+            if empty_pages >= MAX_EMPTY_PAGES:
+                break
+            current_url = next_page_url(current_url)
+            page_num += 1
             continue
 
-    if all_thumbs:
-        await status.edit_text("🖼 *Thumbnail collage bana raha hoon...*", parse_mode=MD)
-        collage_path = make_collage(all_thumbs)
-        if collage_path:
-            total_vids = sum(len(m["videos"]) for m in all_meta)
-            all_tags = list(dict.fromkeys(t for m in all_meta for t in m["tags"]))[:12]
-            tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in all_tags)
-            collage_cap = (
-                f"📦 *Bulk Upload — {total_posts} Posts*\n\n"
-                f"🎬 Total Videos: {total_vids}\n"
-                f"🏷 {tag_str}"
-            )
+        empty_pages = 0
+
+        new_posts = []
+        for link in post_links:
+            if is_processed(link):
+                total_already_done += 1
+            else:
+                new_posts.append(link)
+
+        if not new_posts:
+            logger.info(f"Page {page_num} — all already processed, moving to next")
+            current_url = next_page_url(current_url)
+            page_num += 1
+            await asyncio.sleep(1)
+            continue
+
+        all_thumbs = []
+        all_meta = []
+
+        for i, post_url in enumerate(new_posts, 1):
             try:
-                await safe_send_photo(client, dest, collage_path, collage_cap)
+                meta = extract_post_metadata(post_url)
+                meta["url"] = post_url
+                all_meta.append(meta)
+                if meta["thumbnail"]:
+                    all_thumbs.append(meta["thumbnail"])
+                try:
+                    await status.edit_text(
+                        f"📊 *Page {page_num} — Collecting {i}/{len(new_posts)}*\n📄 {meta['title'][:60]}\n\n"
+                        f"✅ Bheje: {total_videos_sent} | 🔁 Done: {total_already_done}",
+                        parse_mode=MD,
+                    )
+                except (MessageNotModified, Exception):
+                    pass
+                await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Collage send error: {e}")
-            finally:
-                if os.path.exists(collage_path):
-                    os.remove(collage_path)
-
-    videos_sent = 0
-    skipped = 0
-
-    for post_idx, meta in enumerate(all_meta, 1):
-        post_url = meta["url"]
-        title = meta["title"]
-        desc = meta["desc"]
-        tags = meta["tags"]
-        thumbnail = meta["thumbnail"]
-        videos = meta["videos"]
-
-        if not videos:
-            skipped += 1
-            continue
-
-        caption = build_caption(title, desc, tags, len(videos), videos)
-
-        thumb_path = download_thumb(thumbnail) if thumbnail else None
-        if thumb_path:
-            try:
-                await safe_send_photo(client, dest, thumb_path, caption)
-            except Exception:
-                pass
-            finally:
-                if os.path.exists(thumb_path):
-                    os.remove(thumb_path)
-
-        for vid_idx, video_url in enumerate(videos, 1):
-            try:
-                await status.edit_text(
-                    f"⬇️ *Post {post_idx}/{total_posts} · Vid {vid_idx}/{len(videos)}*\n"
-                    f"📄 {title[:50]}\n\n"
-                    f"✅ Bheje: {videos_sent} | ⏭ Skip: {skipped}",
-                    parse_mode=MD,
-                )
-            except (MessageNotModified, Exception):
-                pass
-
-            tmp_path = await download_video(
-                video_url, post_url, status,
-                f"P{post_idx}/{total_posts} V{vid_idx}/{len(videos)}"
-            )
-            if not tmp_path:
+                logger.error(f"Meta error {post_url}: {e}")
                 continue
-            try:
-                vid_cap = f"🎬 {vid_idx}/{len(videos)} — {title}" if len(videos) > 1 else title
-                sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
-                if sent:
-                    videos_sent += 1
-            except Exception as e:
-                logger.error(f"Upload P{post_idx} V{vid_idx}: {e}")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
 
-        skipped_this = len(videos) == 0
-        if not skipped_this:
-            await asyncio.sleep(2)
+        if all_thumbs and len(all_thumbs) > 1:
+            collage_path = make_collage(all_thumbs)
+            if collage_path:
+                total_vids = sum(len(m["videos"]) for m in all_meta)
+                all_tags = list(dict.fromkeys(t for m in all_meta for t in m["tags"]))[:10]
+                tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in all_tags)
+                collage_cap = (
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 *PAGE {page_num} — {len(new_posts)} POSTS*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🎬 Total Videos: *{total_vids}*\n"
+                    f"🏷 {tag_str}"
+                )
+                try:
+                    await safe_send_photo(client, dest, collage_path, collage_cap)
+                finally:
+                    if os.path.exists(collage_path):
+                        os.remove(collage_path)
+
+        for post_idx, meta in enumerate(all_meta, 1):
+            post_url = meta["url"]
+            title = meta["title"]
+            videos = meta["videos"]
+
+            if not videos:
+                total_skipped += 1
+                continue
+
+            caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
+
+            thumb_path = download_thumb(meta["thumbnail"]) if meta["thumbnail"] else None
+            if thumb_path:
+                try:
+                    await safe_send_photo(client, dest, thumb_path, caption)
+                finally:
+                    if os.path.exists(thumb_path):
+                        os.remove(thumb_path)
+
+            for vid_idx, video_url in enumerate(videos, 1):
+                try:
+                    await status.edit_text(
+                        f"⬇️ *P{page_num} · Post {post_idx}/{len(all_meta)} · Vid {vid_idx}/{len(videos)}*\n"
+                        f"📄 {title[:50]}\n💾 Free: {free_mb()}MB\n\n"
+                        f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped}",
+                        parse_mode=MD,
+                    )
+                except (MessageNotModified, Exception):
+                    pass
+
+                tmp_path = await download_video(
+                    video_url, post_url, status,
+                    f"P{page_num} Post{post_idx} Vid{vid_idx}"
+                )
+                if not tmp_path:
+                    continue
+                try:
+                    vid_cap = f"🎬 {vid_idx}/{len(videos)} — {title}" if len(videos) > 1 else title
+                    sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
+                    if sent:
+                        total_videos_sent += 1
+                except Exception as e:
+                    logger.error(f"Upload error: {e}")
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+            mark_processed(post_url, title, len(videos))
+            await asyncio.sleep(1)
+
+        current_url = next_page_url(current_url)
+        page_num += 1
+        await asyncio.sleep(2)
 
     await status.edit_text(
-        f"✅ *Sab ho gaya!*\n\n"
-        f"📄 Posts: {total_posts}\n"
-        f"🎬 Videos bheje: {videos_sent}\n"
-        f"⏭ Skip: {skipped}\n"
-        f"📡 Channel: `{dest}`",
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ *MGET COMPLETE!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📄 Pages scanned: *{page_num - 1}*\n"
+        f"🎬 Videos bheje: *{total_videos_sent}*\n"
+        f"⏭ Skip (no video): *{total_skipped}*\n"
+        f"🔁 Already processed: *{total_already_done}*\n"
+        f"📡 Channel: `{dest}`\n"
+        f"💾 Free disk: *{free_mb()} MB*",
         parse_mode=MD,
     )
 
@@ -458,17 +549,11 @@ async def video_cmd(client, message):
     status = await message.reply_text("🎬 Video links dhundh raha hoon...")
     try:
         meta = extract_post_metadata(url)
-        videos = meta["videos"]
-        iframes = meta["iframes"]
-        title = meta["title"]
+        videos, iframes, title = meta["videos"], meta["iframes"], meta["title"]
         if videos:
-            msg = f"✅ *{title}*\n\n🎬 Video Links ({len(videos)}):\n"
-            for i, v in enumerate(videos[:15], 1):
-                msg += f"\n{i}. `{v}`"
+            msg = f"✅ *{title}*\n\n🎬 Video Links ({len(videos)}):\n" + "\n".join(f"\n{i}. `{v}`" for i, v in enumerate(videos[:15], 1))
         elif iframes:
-            msg = f"⚠️ Direct MP4 nahi mila.\n\n🖼 Player ({len(iframes)}):\n"
-            for i, v in enumerate(iframes[:5], 1):
-                msg += f"\n{i}. {v}"
+            msg = f"⚠️ Direct MP4 nahi mila.\n\n🖼 Players ({len(iframes)}):\n" + "\n".join(f"\n{i}. {v}" for i, v in enumerate(iframes[:5], 1))
         else:
             msg = f"❌ Koi video nahi mila.\nTitle: {title}"
         await status.edit_text(msg[:3900], parse_mode=MD, disable_web_page_preview=True)
