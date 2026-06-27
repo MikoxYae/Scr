@@ -58,12 +58,42 @@ def extract_url_from_message(message) -> str | None:
     return None
 
 
+_peer_cache: dict = {}
+
+
+async def resolve_peer(client, chat_id):
+    """Resolve and cache peer so Pyrogram can find it."""
+    key = str(chat_id)
+    if key not in _peer_cache:
+        try:
+            chat = await client.get_chat(chat_id)
+            _peer_cache[key] = chat.id
+            logger.info(f"Peer resolved: {chat_id} → {chat.id} ({getattr(chat, 'title', '')})")
+        except Exception as e:
+            logger.error(f"Peer resolve failed for {chat_id}: {e}")
+            return None
+    return _peer_cache[key]
+
+
 async def safe_send_video(client, chat_id, video, caption, status_msg=None):
     """Send video with FloodWait retry."""
+    resolved = await resolve_peer(client, chat_id)
+    if resolved is None:
+        logger.error(f"Cannot send video — peer not resolved: {chat_id}")
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"❌ Channel/Group access error!\n\nBot ko `{chat_id}` mein *admin* banao phir `/setchannel` dobara karo.",
+                    parse_mode=MD,
+                )
+            except Exception:
+                pass
+        return False
+
     for attempt in range(3):
         try:
             await client.send_video(
-                chat_id=chat_id,
+                chat_id=resolved,
                 video=video,
                 caption=caption,
                 supports_streaming=True,
@@ -75,28 +105,34 @@ async def safe_send_video(client, chat_id, video, caption, status_msg=None):
             logger.warning(f"FloodWait {wait}s — waiting...")
             if status_msg:
                 try:
-                    await status_msg.edit_text(f"⏳ Flood limit — {wait}s wait kar raha hoon...", parse_mode=MD)
+                    await status_msg.edit_text(f"⏳ Flood limit — {wait}s ruk raha hoon...", parse_mode=MD)
                 except Exception:
                     pass
             await asyncio.sleep(wait)
         except Exception as e:
-            logger.error(f"send_video error: {e}")
-            return False
+            logger.error(f"send_video error (attempt {attempt+1}): {e}")
+            if attempt == 2:
+                return False
     return False
 
 
 async def safe_send_photo(client, chat_id, photo, caption):
     """Send photo with FloodWait retry."""
+    resolved = await resolve_peer(client, chat_id)
+    if resolved is None:
+        return False
+
     for attempt in range(3):
         try:
-            await client.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode=MD)
+            await client.send_photo(chat_id=resolved, photo=photo, caption=caption, parse_mode=MD)
             await asyncio.sleep(SEND_DELAY)
             return True
         except FloodWait as e:
             await asyncio.sleep(e.value + 2)
         except Exception as e:
-            logger.error(f"send_photo error: {e}")
-            return False
+            logger.error(f"send_photo error (attempt {attempt+1}): {e}")
+            if attempt == 2:
+                return False
     return False
 
 
