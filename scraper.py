@@ -60,7 +60,7 @@ def build_message(url, title, desc, links):
     return "
 ".join(parts)[:3900]
 
-async def send_result(url, target_chat_id=CHAT_ID):
+async def send_result(url, target_chat_id):
     title, desc, links = scrape_page(url)
     message = build_message(url, title, desc, links)
     await app.send_message(target_chat_id, message, disable_web_page_preview=True)
@@ -69,13 +69,13 @@ async def send_result(url, target_chat_id=CHAT_ID):
 async def scrape_cmd(client, message):
     text = message.text or ""
     parts = text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) > 1 else URL
+    url = parts[1].strip() if len(parts) > 1 else DEFAULT_URL
     await message.reply_text("Scraping started...")
     await send_result(url, message.chat.id)
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
+    parser.add_argument("url", nargs="?", default=DEFAULT_URL, help="Page URL to scrape")
     args = parser.parse_args()
 
     async with app:
