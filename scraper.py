@@ -8,6 +8,8 @@ from pyrogram import Client, filters
 
 load_dotenv()
 
+load_dotenv()
+
 URL = os.getenv("DEFAULT_URL", "https://t.me/+FGb29j_u1bpmMjEx")
 CHAT_ID = os.getenv("CHAT_ID", "-1004453461157")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8603042415:AAGjOKwH8uDaLG5AWjP-CTh0hQ6qHGTJ_2Y")
