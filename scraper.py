@@ -8,8 +8,6 @@ from pyrogram import Client, filters
 
 load_dotenv()
 
-load_dotenv()
-
 URL = os.getenv("DEFAULT_URL", "https://t.me/+FGb29j_u1bpmMjEx")
 CHAT_ID = os.getenv("CHAT_ID", "-1004453461157")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8603042415:AAGjOKwH8uDaLG5AWjP-CTh0hQ6qHGTJ_2Y")
@@ -59,8 +57,7 @@ def build_message(url, title, desc, links):
         parts.append(f"{i}. {t or 'No text'}")
         parts.append(h)
         parts.append("")
-    return "
-".join(parts)[:3900]
+    return "\n".join(parts)[:3900]
 
 async def send_result(url, target_chat_id):
     title, desc, links = scrape_page(url)
@@ -71,13 +68,13 @@ async def send_result(url, target_chat_id):
 async def scrape_cmd(client, message):
     text = message.text or ""
     parts = text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) > 1 else DEFAULT_URL
+    url = parts[1].strip() if len(parts) > 1 else URL
     await message.reply_text("Scraping started...")
     await send_result(url, message.chat.id)
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url", nargs="?", default=DEFAULT_URL, help="Page URL to scrape")
+    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
     args = parser.parse_args()
 
     async with app:
