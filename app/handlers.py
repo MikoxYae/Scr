@@ -4,7 +4,7 @@ import tempfile
 import requests
 from pyrogram import filters, enums
 from app.bot import app
-from app.scraper import extract_video_from_page, scrape_page_info, HEADERS
+from app.scraper import extract_video_from_page, scrape_page_info, extract_post_links, HEADERS
 from app.utils.logger import logger
 
 MD = enums.ParseMode.MARKDOWN
@@ -220,3 +220,135 @@ async def video_cmd(client, message):
     except Exception as e:
         logger.error(f"/video error: {e}")
         await status.edit_text(f"❌ Error: {e}")
+
+
+@app.on_message(filters.command("mget"))
+async def mget_cmd(client, message):
+    url = extract_url_from_message(message)
+    if not url:
+        await message.reply_text(
+            "URL do: `/mget https://desihub.to/explore/1`\n\nYe page ke saare posts scan karega aur videos bhejega.",
+            parse_mode=MD,
+        )
+        return
+
+    logger.info(f"/mget called: {url}")
+    status = await message.reply_text(
+        f"🔍 *Posts dhundh raha hoon...*\n`{url}`",
+        parse_mode=MD,
+        disable_web_page_preview=True,
+    )
+
+    try:
+        post_links = extract_post_links(url)
+    except Exception as e:
+        logger.error(f"/mget page error: {e}")
+        await status.edit_text(f"❌ Page load error: {e}")
+        return
+
+    if not post_links:
+        await status.edit_text("❌ Is page pe koi post link nahi mila.")
+        return
+
+    await status.edit_text(
+        f"✅ *{len(post_links)} posts mile!*\nHar post se videos extract kar raha hoon...\n\n⏳ Shuru ho raha hai...",
+        parse_mode=MD,
+    )
+
+    total_posts = len(post_links)
+    videos_sent = 0
+    skipped = 0
+
+    for post_idx, post_url in enumerate(post_links, 1):
+        try:
+            await status.edit_text(
+                f"📄 *Post {post_idx}/{total_posts}*\n`{post_url[:80]}`\n\n"
+                f"✅ Bheje: {videos_sent} videos | ⏭ Skip: {skipped}",
+                parse_mode=MD,
+                disable_web_page_preview=True,
+            )
+
+            title, videos, iframes = extract_video_from_page(post_url)
+
+            if not videos:
+                skipped += 1
+                logger.info(f"No videos in post {post_idx}: {post_url}")
+                continue
+
+            for vid_idx, video_url in enumerate(videos, 1):
+                tmp_path = None
+                try:
+                    dl_headers = {**HEADERS, "Referer": post_url}
+                    with requests.get(video_url, headers=dl_headers, stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        total_bytes = int(r.headers.get("content-length", 0))
+                        done = 0
+                        last_edit = 0
+
+                        suffix = ".mp4"
+                        for ext in [".mp4", ".webm", ".mkv", ".mov", ".flv"]:
+                            if ext in video_url.lower():
+                                suffix = ext
+                                break
+
+                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir="data") as tmp:
+                            tmp_path = tmp.name
+                            for chunk in r.iter_content(chunk_size=512 * 1024):
+                                if chunk:
+                                    tmp.write(chunk)
+                                    done += len(chunk)
+                                    now = time.time()
+                                    if now - last_edit > 2:
+                                        bar = progress_bar(done, total_bytes)
+                                        try:
+                                            await status.edit_text(
+                                                f"⬇️ *Post {post_idx}/{total_posts} · Vid {vid_idx}/{len(videos)}*\n{bar}\n\n"
+                                                f"📄 {title[:60]}",
+                                                parse_mode=MD,
+                                            )
+                                        except Exception:
+                                            pass
+                                        last_edit = now
+
+                    last_up = [0]
+
+                    async def upload_progress(current, total_b, pi=post_idx, vi=vid_idx):
+                        now = time.time()
+                        if now - last_up[0] > 3:
+                            bar = progress_bar(current, total_b)
+                            try:
+                                await status.edit_text(
+                                    f"📤 *Uploading P{pi} V{vi}*\n{bar}",
+                                    parse_mode=MD,
+                                )
+                            except Exception:
+                                pass
+                            last_up[0] = now
+
+                    await message.reply_video(
+                        video=tmp_path,
+                        caption=f"🎬 Post {post_idx}/{total_posts} · Vid {vid_idx}/{len(videos)}\n📄 {title}\n🔗 {post_url}",
+                        supports_streaming=True,
+                        progress=upload_progress,
+                    )
+                    videos_sent += 1
+                    logger.info(f"Sent video {vid_idx} from post {post_idx}")
+
+                except Exception as e:
+                    logger.error(f"Post {post_idx} vid {vid_idx} error: {e}")
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+        except Exception as e:
+            logger.error(f"Post {post_idx} error: {e}")
+            skipped += 1
+            continue
+
+    await status.edit_text(
+        f"✅ *Sab ho gaya!*\n\n"
+        f"📄 Posts scan: {total_posts}\n"
+        f"🎬 Videos bheje: {videos_sent}\n"
+        f"⏭ Skip (no video): {skipped}",
+        parse_mode=MD,
+    )

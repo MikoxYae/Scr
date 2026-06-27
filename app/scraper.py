@@ -58,6 +58,43 @@ def extract_video_from_page(url: str):
     return title, seen, iframes
 
 
+def extract_post_links(url: str):
+    """
+    Given a listing/index/category page URL, return all unique post links found on it.
+    Tries to be smart: prefers links whose href contains '/post/' or '/video/' or '/p/',
+    falls back to all internal links if nothing specific found.
+    """
+    from urllib.parse import urlparse
+    r = requests.get(url, headers={**HEADERS, "Referer": url}, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    post_keywords = ["/post/", "/video/", "/videos/", "/p/", "/watch/", "/content/", "/media/"]
+
+    seen = set()
+    post_links = []
+    all_internal = []
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href or href.startswith("#") or href.startswith("javascript"):
+            continue
+        full = href if href.startswith("http") else urljoin(base, href)
+        # must be same domain
+        if urlparse(full).netloc != urlparse(url).netloc:
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        if any(kw in full for kw in post_keywords):
+            post_links.append(full)
+        else:
+            all_internal.append(full)
+
+    return post_links if post_links else all_internal
+
+
 def scrape_page_info(url: str):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
