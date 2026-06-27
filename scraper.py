@@ -80,7 +80,13 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
     args = parser.parse_args()
-    await send_result(args.url, CHAT_ID)
+
+    await app.start()
+    try:
+        await send_result(args.url, CHAT_ID)
+    finally:
+        await app.stop()
 
 if __name__ == "__main__":
-    app.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
