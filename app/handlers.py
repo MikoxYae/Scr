@@ -33,12 +33,17 @@ def build_caption(title: str, desc: str, tags: list, video_count: int, videos: l
                 ext = e.lstrip(".").upper()
                 break
     tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in tags[:8]) if tags else ""
-    parts = [f"📹 *{title}*"]
+    parts = [
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🎬 *{title.upper()}*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
     if desc:
-        parts.append(f"\n📝 {desc[:250]}")
+        parts.append(f"\n📝 _{desc[:250]}_")
     if tag_str:
         parts.append(f"\n🏷 {tag_str}")
-    parts.append(f"\n🎬 {video_count} Video{'s' if video_count > 1 else ''} · {ext}")
+    parts.append(f"\n📦 *{video_count} Video{'s' if video_count > 1 else ''}*  |  `{ext}`")
+    parts.append(f"━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(parts)
 
 
