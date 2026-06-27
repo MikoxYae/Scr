@@ -12,7 +12,7 @@ API_HASH  = os.getenv("API_HASH",    "cc73af06049861e86e404ddd1fc6da35")
 app = Client("scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
-async def _async_run():
+async def _main():
     from app import handlers  # noqa: F401 — registers all handlers
     from app.utils.logger import logger
     from app.db import mongo
@@ -24,11 +24,13 @@ async def _async_run():
         logger.info("MongoDB: disabled (bot running normally without it)")
 
     logger.info("Bot chal raha hai... Ctrl+C se band karo")
-    async with app:
-        await idle()
 
+    await app.start()
+    await idle()
+    await app.stop()
     await mongo.disconnect()
 
 
 def run():
-    asyncio.run(_async_run())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_main())
