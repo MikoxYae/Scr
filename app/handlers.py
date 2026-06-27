@@ -10,7 +10,7 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from app.bot import app
 from app.scraper import extract_post_metadata, extract_post_links, scrape_page_info, HEADERS
 from app.config import get_channel, set_channel
-from app.db import is_processed, mark_processed, get_stats
+from app.db import mongo
 from app.utils.logger import logger
 from app.utils.thumb import make_collage, download_thumb
 
@@ -19,6 +19,7 @@ SEND_DELAY = 3
 MIN_FREE_MB = 200
 
 _stop_flags: dict[int, bool] = {}
+_current_jobs: dict[int, str] = {}
 
 
 def progress_bar(done: int, total: int) -> str:
@@ -219,6 +220,9 @@ async def download_video(video_url: str, referer: str, status_msg, label: str) -
 async def stop_cmd(client, message):
     chat_id = message.chat.id
     _stop_flags[chat_id] = True
+    job_id = _current_jobs.get(chat_id)
+    if job_id:
+        await mongo.mark_stopped(job_id)
     await message.reply_text(
         "🛑 *Stop signal bhej diya!*\n\nCurrent job ruk jayega — thoda wait karo...",
         parse_mode=MD,
@@ -227,9 +231,9 @@ async def stop_cmd(client, message):
 
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message):
-    stats = get_stats()
     ch = get_channel()
     ch_info = f"`{ch}`" if ch else "Not set"
+    db_status = "✅ Connected" if mongo.is_connected() else "❌ Disabled"
     await message.reply_text(
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 *SCRAPER BOT — HELP*\n"
@@ -244,7 +248,7 @@ async def help_cmd(client, message):
         "`/setchannel <id>` — Upload channel set karo\n"
         "`/getchannel` — Current channel dekho\n\n"
         "*📊 Stats:*\n"
-        "`/stats` — Processed posts count\n\n"
+        "`/stats` — Bot stats aur MongoDB status\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*⚙️ Features:*\n"
         "• Auto multi-page — `/mget` khud pages badlata hai\n"
@@ -253,7 +257,7 @@ async def help_cmd(client, message):
         "• Disk guard — storage full hone se pehle warn karta hai\n"
         "• Thumbnail collage — saare thumbs ek pic mein\n\n"
         f"📡 Channel: {ch_info}\n"
-        f"📊 Total Processed: *{stats['total']}* posts\n"
+        f"🗄 MongoDB: {db_status}\n"
         "━━━━━━━━━━━━━━━━━━━━",
         parse_mode=MD,
     )
@@ -261,15 +265,55 @@ async def help_cmd(client, message):
 
 @app.on_message(filters.command("stats"))
 async def stats_cmd(client, message):
-    stats = get_stats()
     ch = get_channel()
-    await message.reply_text(
-        f"📊 *Bot Stats*\n\n"
-        f"✅ Processed posts: *{stats['total']}*\n"
-        f"📡 Channel: `{ch or 'Not set'}`\n"
-        f"💾 Free disk: *{free_mb()} MB*",
-        parse_mode=MD,
-    )
+    db_status = "✅ Connected" if mongo.is_connected() else "❌ Disconnected"
+
+    if mongo.is_connected():
+        stats = await mongo.get_stats()
+        current_job = await mongo.get_current_job()
+        last_job = await mongo.get_last_job() if not current_job else None
+
+        job_info = ""
+        if current_job:
+            job_info = (
+                f"\n\n🔄 *Running Job:*\n"
+                f"  Command: `{current_job.get('command', '?')}`\n"
+                f"  Processed: {current_job.get('processed_count', 0)} | "
+                f"Sent: {current_job.get('sent_count', 0)} | "
+                f"Skipped: {current_job.get('skipped_count', 0)}"
+            )
+        elif last_job:
+            job_info = (
+                f"\n\n📋 *Last Job:*\n"
+                f"  Command: `{last_job.get('command', '?')}` — {last_job.get('status', '?')}\n"
+                f"  Sent: {last_job.get('sent_count', 0)} | "
+                f"Skipped: {last_job.get('skipped_count', 0)} | "
+                f"Failed: {last_job.get('failed_count', 0)}"
+            )
+
+        await message.reply_text(
+            f"📊 *Bot Stats*\n\n"
+            f"🗄 MongoDB: {db_status}\n\n"
+            f"*Lifetime Stats:*\n"
+            f"📥 Scraped: *{stats.get('total_scraped', 0)}*\n"
+            f"✅ Sent: *{stats.get('total_sent', 0)}*\n"
+            f"❌ Failed: *{stats.get('total_failed', 0)}*\n"
+            f"⏭ Skipped: *{stats.get('total_skipped', 0)}*\n"
+            f"🗂 Total Jobs: *{stats.get('total_jobs', 0)}*\n\n"
+            f"📡 Channel: `{ch or 'Not set'}`\n"
+            f"💾 Free disk: *{free_mb()} MB*"
+            f"{job_info}",
+            parse_mode=MD,
+        )
+    else:
+        await message.reply_text(
+            f"📊 *Bot Stats*\n\n"
+            f"🗄 MongoDB: {db_status}\n\n"
+            f"📡 Channel: `{ch or 'Not set'}`\n"
+            f"💾 Free disk: *{free_mb()} MB*\n\n"
+            f"_Add MONGO\\_URI secret to enable stats tracking._",
+            parse_mode=MD,
+        )
 
 
 @app.on_message(filters.command("start"))
@@ -298,13 +342,16 @@ async def setchannel_cmd(client, message):
     channel_id = int(raw) if raw.lstrip("-").isdigit() else raw
     _peer_cache.clear()
     set_channel(channel_id)
+    await mongo.save_channel(message.from_user.id, channel_id)
     logger.info(f"Channel set: {channel_id}")
     await message.reply_text(f"✅ Channel set:\n`{channel_id}`", parse_mode=MD)
 
 
 @app.on_message(filters.command("getchannel"))
 async def getchannel_cmd(client, message):
-    ch = get_channel()
+    ch = await mongo.get_channel(message.from_user.id)
+    if ch is None:
+        ch = get_channel()
     if ch:
         await message.reply_text(f"📡 Current channel: `{ch}`", parse_mode=MD)
     else:
@@ -322,7 +369,13 @@ async def get_cmd(client, message):
 
     channel = get_channel()
     dest = channel or message.chat.id
+    dest_str = str(dest)
+    chat_id = message.chat.id
     logger.info(f"/get {url} → {dest}")
+
+    job_id = await mongo.create_job("/get", url, dest)
+    _current_jobs[chat_id] = job_id
+    _stop_flags[chat_id] = False
 
     status = await message.reply_text("🔍 *Scan kar raha hoon...*", parse_mode=MD)
 
@@ -330,6 +383,8 @@ async def get_cmd(client, message):
         meta = extract_post_metadata(url)
     except Exception as e:
         await status.edit_text(f"❌ Page load error: {e}")
+        await mongo.finish_job(job_id, status="failed", error_message=str(e))
+        _current_jobs.pop(chat_id, None)
         return
 
     title = meta["title"]
@@ -339,8 +394,22 @@ async def get_cmd(client, message):
     if not videos:
         msg = f"⚠️ Direct video nahi mila.\n\n🖼 Players ({len(iframes)}):\n" + "\n".join(iframes[:5]) if iframes else "❌ Koi video nahi mila."
         await status.edit_text(msg, disable_web_page_preview=True)
+        await mongo.finish_job(job_id, status="completed")
+        _current_jobs.pop(chat_id, None)
         return
 
+    if await mongo.is_post_processed(url, dest_str):
+        await status.edit_text(
+            f"⏭ *Already processed!*\n\n`{url}`\n\nYe post pehle hi is channel pe bheja ja chuka hai.",
+            parse_mode=MD,
+        )
+        await mongo.update_job(job_id, skipped_count=1)
+        await mongo.increment_stats(skipped=1)
+        await mongo.finish_job(job_id, status="completed")
+        _current_jobs.pop(chat_id, None)
+        return
+
+    await mongo.update_job(job_id, total_found=len(videos))
     caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
 
     await status.edit_text(
@@ -356,19 +425,47 @@ async def get_cmd(client, message):
             if os.path.exists(thumb_path):
                 os.remove(thumb_path)
 
+    sent_count = 0
+    failed_count = 0
+
     for idx, video_url in enumerate(videos, 1):
+        if _stop_flags.get(chat_id):
+            _stop_flags[chat_id] = False
+            await mongo.mark_stopped(job_id)
+            _current_jobs.pop(chat_id, None)
+            await status.edit_text(f"🛑 *Job stopped!* ({idx-1}/{len(videos)} videos sent)", parse_mode=MD)
+            return
+
         tmp_path = await download_video(video_url, url, status, f"Downloading {idx}/{len(videos)}")
         if not tmp_path:
+            failed_count += 1
+            await mongo.update_job(job_id, processed_count=idx, failed_count=failed_count, sent_count=sent_count)
+            await mongo.increment_stats(failed=1)
             continue
         try:
             await status.edit_text(f"📤 *Uploading {idx}/{len(videos)}...*", parse_mode=MD)
             vid_cap = f"🎬 {idx}/{len(videos)} — {title}" if len(videos) > 1 else title
-            await safe_send_video(client, dest, tmp_path, vid_cap, status)
+            sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
+            if sent:
+                sent_count += 1
+                await mongo.increment_stats(sent=1)
+            else:
+                failed_count += 1
+                await mongo.increment_stats(failed=1)
+        except Exception as e:
+            logger.error(f"Upload error: {e}")
+            failed_count += 1
+            await mongo.increment_stats(failed=1)
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+        await mongo.update_job(job_id, processed_count=idx, sent_count=sent_count, failed_count=failed_count)
 
-    mark_processed(url, title, len(videos))
+    await mongo.save_processed_post(url, url, dest_str, "video", "sent")
+    await mongo.increment_stats(scraped=1)
+    await mongo.finish_job(job_id, status="completed")
+    _current_jobs.pop(chat_id, None)
+
     await status.edit_text(
         f"✅ *Done!* — {title[:60]}\n🎬 {len(videos)} videos → `{dest}`", parse_mode=MD,
     )
@@ -386,7 +483,13 @@ async def mget_cmd(client, message):
 
     channel = get_channel()
     dest = channel or message.chat.id
+    dest_str = str(dest)
     logger.info(f"/mget {url} → {dest}")
+
+    chat_id = message.chat.id
+    job_id = await mongo.create_job("/mget", url, dest)
+    _current_jobs[chat_id] = job_id
+    _stop_flags[chat_id] = False
 
     status = await message.reply_text(
         "🔍 *Bulk scrape shuru ho raha hai...*\nBot tab tak chalega jab tak saare posts khatam na ho jayein.",
@@ -398,106 +501,16 @@ async def mget_cmd(client, message):
     total_videos_sent = 0
     total_skipped = 0
     total_already_done = 0
+    total_failed = 0
     empty_pages = 0
     MAX_EMPTY_PAGES = 2
-    chat_id = message.chat.id
-    _stop_flags[chat_id] = False
 
-    while True:
-        if _stop_flags.get(chat_id):
-            _stop_flags[chat_id] = False
-            await status.edit_text(
-                f"🛑 *Job rok diya!*\n\n"
-                f"📄 Pages: *{page_num}* | 🎬 Videos: *{total_videos_sent}* | 🔁 Skip: *{total_already_done}*",
-                parse_mode=MD,
-            )
-            return
-
-        try:
-            await status.edit_text(
-                f"📄 *Page {page_num} scan kar raha hoon...*\n`{current_url}`\n\n"
-                f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped} | 🔁 Already done: {total_already_done}",
-                parse_mode=MD, disable_web_page_preview=True,
-            )
-        except (MessageNotModified, Exception):
-            pass
-
-        try:
-            post_links = extract_post_links(current_url)
-        except Exception as e:
-            logger.error(f"Page {page_num} error: {e}")
-            break
-
-        if not post_links:
-            empty_pages += 1
-            logger.info(f"Empty page {page_num} ({empty_pages}/{MAX_EMPTY_PAGES})")
-            if empty_pages >= MAX_EMPTY_PAGES:
-                break
-            current_url = next_page_url(current_url)
-            page_num += 1
-            continue
-
-        empty_pages = 0
-
-        new_posts = []
-        for link in post_links:
-            if is_processed(link):
-                total_already_done += 1
-            else:
-                new_posts.append(link)
-
-        if not new_posts:
-            logger.info(f"Page {page_num} — all already processed, moving to next")
-            current_url = next_page_url(current_url)
-            page_num += 1
-            await asyncio.sleep(1)
-            continue
-
-        all_thumbs = []
-        all_meta = []
-
-        for i, post_url in enumerate(new_posts, 1):
-            try:
-                meta = extract_post_metadata(post_url)
-                meta["url"] = post_url
-                all_meta.append(meta)
-                if meta["thumbnail"]:
-                    all_thumbs.append(meta["thumbnail"])
-                try:
-                    await status.edit_text(
-                        f"📊 *Page {page_num} — Collecting {i}/{len(new_posts)}*\n📄 {meta['title'][:60]}\n\n"
-                        f"✅ Bheje: {total_videos_sent} | 🔁 Done: {total_already_done}",
-                        parse_mode=MD,
-                    )
-                except (MessageNotModified, Exception):
-                    pass
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f"Meta error {post_url}: {e}")
-                continue
-
-        if all_thumbs and len(all_thumbs) > 1:
-            collage_path = make_collage(all_thumbs)
-            if collage_path:
-                total_vids = sum(len(m["videos"]) for m in all_meta)
-                all_tags = list(dict.fromkeys(t for m in all_meta for t in m["tags"]))[:10]
-                tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in all_tags)
-                collage_cap = (
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📦 *PAGE {page_num} — {len(new_posts)} POSTS*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"🎬 Total Videos: *{total_vids}*\n"
-                    f"🏷 {tag_str}"
-                )
-                try:
-                    await safe_send_photo(client, dest, collage_path, collage_cap)
-                finally:
-                    if os.path.exists(collage_path):
-                        os.remove(collage_path)
-
-        for post_idx, meta in enumerate(all_meta, 1):
+    try:
+        while True:
             if _stop_flags.get(chat_id):
                 _stop_flags[chat_id] = False
+                await mongo.mark_stopped(job_id)
+                _current_jobs.pop(chat_id, None)
                 await status.edit_text(
                     f"🛑 *Job rok diya!*\n\n"
                     f"📄 Pages: *{page_num}* | 🎬 Videos: *{total_videos_sent}* | 🔁 Skip: *{total_already_done}*",
@@ -505,77 +518,198 @@ async def mget_cmd(client, message):
                 )
                 return
 
-            post_url = meta["url"]
-            title = meta["title"]
-            videos = meta["videos"]
+            try:
+                await status.edit_text(
+                    f"📄 *Page {page_num} scan kar raha hoon...*\n`{current_url}`\n\n"
+                    f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped} | 🔁 Already done: {total_already_done}",
+                    parse_mode=MD, disable_web_page_preview=True,
+                )
+            except (MessageNotModified, Exception):
+                pass
 
-            if not videos:
-                total_skipped += 1
+            try:
+                post_links = extract_post_links(current_url)
+            except Exception as e:
+                logger.error(f"Page {page_num} error: {e}")
+                break
+
+            if not post_links:
+                empty_pages += 1
+                logger.info(f"Empty page {page_num} ({empty_pages}/{MAX_EMPTY_PAGES})")
+                if empty_pages >= MAX_EMPTY_PAGES:
+                    break
+                current_url = next_page_url(current_url)
+                page_num += 1
                 continue
 
-            caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
+            empty_pages = 0
 
-            resolved = await resolve_peer(client, dest)
-            if resolved:
+            new_posts = []
+            for link in post_links:
+                if await mongo.is_post_processed(link, dest_str):
+                    total_already_done += 1
+                else:
+                    new_posts.append(link)
+
+            if not new_posts:
+                logger.info(f"Page {page_num} — all already processed, moving to next")
+                current_url = next_page_url(current_url)
+                page_num += 1
+                await asyncio.sleep(1)
+                continue
+
+            all_thumbs = []
+            all_meta = []
+
+            for i, post_url in enumerate(new_posts, 1):
                 try:
-                    await client.send_message(
-                        chat_id=resolved,
-                        text=(
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 *POST {post_idx} OF {len(all_meta)}*\n"
-                            f"━━━━━━━━━━━━━━━━━━━━"
-                        ),
-                        parse_mode=MD,
-                    )
-                    await asyncio.sleep(SEND_DELAY)
+                    meta = extract_post_metadata(post_url)
+                    meta["url"] = post_url
+                    all_meta.append(meta)
+                    if meta["thumbnail"]:
+                        all_thumbs.append(meta["thumbnail"])
+                    try:
+                        await status.edit_text(
+                            f"📊 *Page {page_num} — Collecting {i}/{len(new_posts)}*\n📄 {meta['title'][:60]}\n\n"
+                            f"✅ Bheje: {total_videos_sent} | 🔁 Done: {total_already_done}",
+                            parse_mode=MD,
+                        )
+                    except (MessageNotModified, Exception):
+                        pass
+                    await asyncio.sleep(0.5)
                 except Exception as e:
-                    logger.error(f"Separator send error: {e}")
-
-            thumb_path = download_thumb(meta["thumbnail"]) if meta["thumbnail"] else None
-            if thumb_path:
-                try:
-                    await safe_send_photo(client, dest, thumb_path, caption)
-                finally:
-                    if os.path.exists(thumb_path):
-                        os.remove(thumb_path)
-
-            for vid_idx, video_url in enumerate(videos, 1):
-                try:
-                    await status.edit_text(
-                        f"⬇️ *P{page_num} · Post {post_idx}/{len(all_meta)} · Vid {vid_idx}/{len(videos)}*\n"
-                        f"📄 {title[:50]}\n💾 Free: {free_mb()}MB\n\n"
-                        f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped}",
-                        parse_mode=MD,
-                    )
-                except (MessageNotModified, Exception):
-                    pass
-
-                tmp_path = await download_video(
-                    video_url, post_url, status,
-                    f"P{page_num} Post{post_idx} Vid{vid_idx}"
-                )
-                if not tmp_path:
+                    logger.error(f"Meta error {post_url}: {e}")
                     continue
-                try:
-                    if len(videos) > 1:
-                        vid_cap = f"🎬 *{title.upper()}*\n📹 Video {vid_idx} of {len(videos)}"
-                    else:
-                        vid_cap = f"🎬 *{title.upper()}*"
-                    sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
-                    if sent:
-                        total_videos_sent += 1
-                except Exception as e:
-                    logger.error(f"Upload error: {e}")
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
 
-            mark_processed(post_url, title, len(videos))
-            await asyncio.sleep(1)
+            if all_thumbs and len(all_thumbs) > 1:
+                collage_path = make_collage(all_thumbs)
+                if collage_path:
+                    total_vids = sum(len(m["videos"]) for m in all_meta)
+                    all_tags = list(dict.fromkeys(t for m in all_meta for t in m["tags"]))[:10]
+                    tag_str = " ".join(f"#{t.replace(' ', '_')}" for t in all_tags)
+                    collage_cap = (
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 *PAGE {page_num} — {len(new_posts)} POSTS*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"🎬 Total Videos: *{total_vids}*\n"
+                        f"🏷 {tag_str}"
+                    )
+                    try:
+                        await safe_send_photo(client, dest, collage_path, collage_cap)
+                    finally:
+                        if os.path.exists(collage_path):
+                            os.remove(collage_path)
 
-        current_url = next_page_url(current_url)
-        page_num += 1
-        await asyncio.sleep(2)
+            for post_idx, meta in enumerate(all_meta, 1):
+                if _stop_flags.get(chat_id):
+                    _stop_flags[chat_id] = False
+                    await mongo.mark_stopped(job_id)
+                    _current_jobs.pop(chat_id, None)
+                    await status.edit_text(
+                        f"🛑 *Job rok diya!*\n\n"
+                        f"📄 Pages: *{page_num}* | 🎬 Videos: *{total_videos_sent}* | 🔁 Skip: *{total_already_done}*",
+                        parse_mode=MD,
+                    )
+                    return
+
+                post_url = meta["url"]
+                title = meta["title"]
+                videos = meta["videos"]
+
+                if not videos:
+                    total_skipped += 1
+                    await mongo.update_job(job_id, skipped_count=total_skipped)
+                    await mongo.increment_stats(skipped=1)
+                    continue
+
+                caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
+
+                resolved = await resolve_peer(client, dest)
+                if resolved:
+                    try:
+                        await client.send_message(
+                            chat_id=resolved,
+                            text=(
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📌 *POST {post_idx} OF {len(all_meta)}*\n"
+                                f"━━━━━━━━━━━━━━━━━━━━"
+                            ),
+                            parse_mode=MD,
+                        )
+                        await asyncio.sleep(SEND_DELAY)
+                    except Exception as e:
+                        logger.error(f"Separator send error: {e}")
+
+                thumb_path = download_thumb(meta["thumbnail"]) if meta["thumbnail"] else None
+                if thumb_path:
+                    try:
+                        await safe_send_photo(client, dest, thumb_path, caption)
+                    finally:
+                        if os.path.exists(thumb_path):
+                            os.remove(thumb_path)
+
+                for vid_idx, video_url in enumerate(videos, 1):
+                    try:
+                        await status.edit_text(
+                            f"⬇️ *P{page_num} · Post {post_idx}/{len(all_meta)} · Vid {vid_idx}/{len(videos)}*\n"
+                            f"📄 {title[:50]}\n💾 Free: {free_mb()}MB\n\n"
+                            f"✅ Bheje: {total_videos_sent} | ⏭ Skip: {total_skipped}",
+                            parse_mode=MD,
+                        )
+                    except (MessageNotModified, Exception):
+                        pass
+
+                    tmp_path = await download_video(
+                        video_url, post_url, status,
+                        f"P{page_num} Post{post_idx} Vid{vid_idx}"
+                    )
+                    if not tmp_path:
+                        total_failed += 1
+                        await mongo.increment_stats(failed=1)
+                        continue
+                    try:
+                        if len(videos) > 1:
+                            vid_cap = f"🎬 *{title.upper()}*\n📹 Video {vid_idx} of {len(videos)}"
+                        else:
+                            vid_cap = f"🎬 *{title.upper()}*"
+                        sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
+                        if sent:
+                            total_videos_sent += 1
+                            await mongo.increment_stats(sent=1)
+                        else:
+                            total_failed += 1
+                            await mongo.increment_stats(failed=1)
+                    except Exception as e:
+                        logger.error(f"Upload error: {e}")
+                        total_failed += 1
+                        await mongo.increment_stats(failed=1)
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+
+                await mongo.save_processed_post(post_url, post_url, dest_str, "video", "sent")
+                await mongo.increment_stats(scraped=1)
+                await mongo.update_job(
+                    job_id,
+                    processed_count=post_idx,
+                    sent_count=total_videos_sent,
+                    failed_count=total_failed,
+                    skipped_count=total_skipped,
+                )
+                await asyncio.sleep(1)
+
+            current_url = next_page_url(current_url)
+            page_num += 1
+            await asyncio.sleep(2)
+
+    except Exception as e:
+        logger.error(f"/mget fatal error: {e}")
+        await mongo.finish_job(job_id, status="failed", error_message=str(e))
+        _current_jobs.pop(chat_id, None)
+        raise
+
+    await mongo.finish_job(job_id, status="completed")
+    _current_jobs.pop(chat_id, None)
 
     await status.edit_text(
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -597,6 +731,14 @@ async def video_cmd(client, message):
     if not url:
         await message.reply_text("URL do: `/video https://desihub.to/post/xyz`", parse_mode=MD)
         return
+
+    channel = get_channel()
+    dest = channel or message.chat.id
+    chat_id = message.chat.id
+
+    job_id = await mongo.create_job("/video", url, dest)
+    _current_jobs[chat_id] = job_id
+
     status = await message.reply_text("🎬 Video links dhundh raha hoon...")
     try:
         meta = extract_post_metadata(url)
@@ -608,8 +750,13 @@ async def video_cmd(client, message):
         else:
             msg = f"❌ Koi video nahi mila.\nTitle: {title}"
         await status.edit_text(msg[:3900], parse_mode=MD, disable_web_page_preview=True)
+        await mongo.update_job(job_id, total_found=len(videos))
+        await mongo.finish_job(job_id, status="completed")
     except Exception as e:
         await status.edit_text(f"❌ Error: {e}")
+        await mongo.finish_job(job_id, status="failed", error_message=str(e))
+    finally:
+        _current_jobs.pop(chat_id, None)
 
 
 @app.on_message(filters.command("scrape"))
@@ -618,6 +765,14 @@ async def scrape_cmd(client, message):
     if not url:
         await message.reply_text("URL do: `/scrape https://example.com`", parse_mode=MD)
         return
+
+    channel = get_channel()
+    dest = channel or message.chat.id
+    chat_id = message.chat.id
+
+    job_id = await mongo.create_job("/scrape", url, dest)
+    _current_jobs[chat_id] = job_id
+
     status = await message.reply_text("⏳ Scraping...")
     try:
         title, desc, links = scrape_page_info(url)
@@ -626,5 +781,9 @@ async def scrape_cmd(client, message):
             msg += f"📝 {desc}\n"
         msg += f"\n🔗 Links ({len(links)}):\n" + "\n".join(links[:15])
         await status.edit_text(msg[:3900], disable_web_page_preview=True)
+        await mongo.finish_job(job_id, status="completed")
     except Exception as e:
         await status.edit_text(f"❌ Error: {e}")
+        await mongo.finish_job(job_id, status="failed", error_message=str(e))
+    finally:
+        _current_jobs.pop(chat_id, None)
