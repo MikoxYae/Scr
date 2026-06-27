@@ -515,6 +515,22 @@ async def mget_cmd(client, message):
 
             caption = build_caption(title, meta["desc"], meta["tags"], len(videos), videos)
 
+            resolved = await resolve_peer(client, dest)
+            if resolved:
+                try:
+                    await client.send_message(
+                        chat_id=resolved,
+                        text=(
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 *POST {post_idx} OF {len(all_meta)}*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        ),
+                        parse_mode=MD,
+                    )
+                    await asyncio.sleep(SEND_DELAY)
+                except Exception as e:
+                    logger.error(f"Separator send error: {e}")
+
             thumb_path = download_thumb(meta["thumbnail"]) if meta["thumbnail"] else None
             if thumb_path:
                 try:
@@ -541,7 +557,10 @@ async def mget_cmd(client, message):
                 if not tmp_path:
                     continue
                 try:
-                    vid_cap = f"🎬 {vid_idx}/{len(videos)} — {title}" if len(videos) > 1 else title
+                    if len(videos) > 1:
+                        vid_cap = f"🎬 *{title.upper()}*\n📹 Video {vid_idx} of {len(videos)}"
+                    else:
+                        vid_cap = f"🎬 *{title.upper()}*"
                     sent = await safe_send_video(client, dest, tmp_path, vid_cap, status)
                     if sent:
                         total_videos_sent += 1
