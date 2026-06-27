@@ -32,7 +32,7 @@ def progress_bar(done: int, total: int) -> str:
 
 
 def free_mb() -> int:
-    return shutil.disk_usage("/home/runner/workspace").free // (1024 * 1024)
+    return shutil.disk_usage("/").free // (1024 * 1024)
 
 
 def build_caption(title: str, desc: str, tags: list, video_count: int, videos: list) -> str:
