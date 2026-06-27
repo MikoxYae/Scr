@@ -57,7 +57,7 @@ def build_message(url, title, desc, links):
         parts.append(f"{i}. {t or 'No text'}")
         parts.append(h)
         parts.append("")
-    return "\n".join(parts)[:3900]
+    return "\n".join(parts)[:3900]   # ✅ Fix 1: "\n" sahi string
 
 async def send_result(url, target_chat_id):
     title, desc, links = scrape_page(url)
@@ -68,13 +68,13 @@ async def send_result(url, target_chat_id):
 async def scrape_cmd(client, message):
     text = message.text or ""
     parts = text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) > 1 else URL
+    url = parts[1].strip() if len(parts) > 1 else URL  # ✅ Fix 2: URL (DEFAULT_URL nahi)
     await message.reply_text("Scraping started...")
     await send_result(url, message.chat.id)
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
+    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")  # ✅ Fix 3: URL
     args = parser.parse_args()
 
     async with app:
