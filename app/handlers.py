@@ -18,6 +18,8 @@ MD = enums.ParseMode.MARKDOWN
 SEND_DELAY = 3
 MIN_FREE_MB = 200
 
+_stop_flags: dict[int, bool] = {}
+
 
 def progress_bar(done: int, total: int) -> str:
     if total <= 0:
@@ -213,6 +215,16 @@ async def download_video(video_url: str, referer: str, status_msg, label: str) -
         return None
 
 
+@app.on_message(filters.command("stop"))
+async def stop_cmd(client, message):
+    chat_id = message.chat.id
+    _stop_flags[chat_id] = True
+    await message.reply_text(
+        "🛑 *Stop signal bhej diya!*\n\nCurrent job ruk jayega — thoda wait karo...",
+        parse_mode=MD,
+    )
+
+
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message):
     stats = get_stats()
@@ -388,8 +400,19 @@ async def mget_cmd(client, message):
     total_already_done = 0
     empty_pages = 0
     MAX_EMPTY_PAGES = 2
+    chat_id = message.chat.id
+    _stop_flags[chat_id] = False
 
     while True:
+        if _stop_flags.get(chat_id):
+            _stop_flags[chat_id] = False
+            await status.edit_text(
+                f"🛑 *Job rok diya!*\n\n"
+                f"📄 Pages: *{page_num}* | 🎬 Videos: *{total_videos_sent}* | 🔁 Skip: *{total_already_done}*",
+                parse_mode=MD,
+            )
+            return
+
         try:
             await status.edit_text(
                 f"📄 *Page {page_num} scan kar raha hoon...*\n`{current_url}`\n\n"
@@ -473,6 +496,15 @@ async def mget_cmd(client, message):
                         os.remove(collage_path)
 
         for post_idx, meta in enumerate(all_meta, 1):
+            if _stop_flags.get(chat_id):
+                _stop_flags[chat_id] = False
+                await status.edit_text(
+                    f"🛑 *Job rok diya!*\n\n"
+                    f"📄 Pages: *{page_num}* | 🎬 Videos: *{total_videos_sent}* | 🔁 Skip: *{total_already_done}*",
+                    parse_mode=MD,
+                )
+                return
+
             post_url = meta["url"]
             title = meta["title"]
             videos = meta["videos"]
