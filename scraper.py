@@ -1,6 +1,4 @@
 import os
-import argparse
-import asyncio
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -59,38 +57,30 @@ def build_message(url, title, desc, links):
         parts.append("")
     return "\n".join(parts)[:3900]
 
-async def send_result(url, target_chat_id):
-    print(f"[*] Scraping: {url}")
-    title, desc, links = scrape_page(url)
-    print(f"[*] Title: {title} | Links found: {len(links)}")
-    message = build_message(url, title, desc, links)
-    print(f"[*] Sending to chat: {target_chat_id}")
-    try:
-        await app.get_chat(target_chat_id)
-    except Exception as e:
-        print(f"[!] get_chat warning: {e}")
-    await app.send_message(int(target_chat_id), message, disable_web_page_preview=True)
-    print("[✓] Message sent successfully!")
+@app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    await message.reply_text(
+        "Bot online hai!\n\n"
+        "Use karo: /scrape <url>\n"
+        "Example: /scrape https://example.com"
+    )
 
 @app.on_message(filters.command("scrape"))
 async def scrape_cmd(client, message):
     text = message.text or ""
     parts = text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) > 1 else URL
-    await message.reply_text("Scraping started...")
-    await send_result(url, message.chat.id)
-
-async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("url", nargs="?", default=URL, help="Page URL to scrape")
-    args = parser.parse_args()
-
-    await app.start()
+    if len(parts) < 2:
+        await message.reply_text("URL do: /scrape https://example.com")
+        return
+    url = parts[1].strip()
+    status = await message.reply_text(f"Scraping: {url} ...")
     try:
-        await send_result(args.url, CHAT_ID)
-    finally:
-        await app.stop()
+        title, desc, links = scrape_page(url)
+        result = build_message(url, title, desc, links)
+        await status.edit_text(result, disable_web_page_preview=True)
+    except Exception as e:
+        await status.edit_text(f"Error: {e}")
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    print("[*] Bot chal raha hai... Ctrl+C se band karo")
+    app.run()
