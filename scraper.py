@@ -60,13 +60,17 @@ def build_message(url, title, desc, links):
     return "\n".join(parts)[:3900]
 
 async def send_result(url, target_chat_id):
+    print(f"[*] Scraping: {url}")
     title, desc, links = scrape_page(url)
+    print(f"[*] Title: {title} | Links found: {len(links)}")
     message = build_message(url, title, desc, links)
+    print(f"[*] Sending to chat: {target_chat_id}")
     try:
         await app.get_chat(target_chat_id)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] get_chat warning: {e}")
     await app.send_message(int(target_chat_id), message, disable_web_page_preview=True)
+    print("[✓] Message sent successfully!")
 
 @app.on_message(filters.command("scrape"))
 async def scrape_cmd(client, message):
